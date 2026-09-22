@@ -28,9 +28,12 @@ CREATE TABLE IF NOT EXISTS paper (
 CREATE TABLE IF NOT EXISTS product (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     order_id BIGINT,
+    prev_order_id BIGINT,
     name VARCHAR(64),
     qty INT,
-    status VARCHAR(16) NOT NULL
+    status VARCHAR(16) NOT NULL,
+    CONSTRAINT chk_product_status CHECK (status IN ('待入库','已入库')),
+    CONSTRAINT chk_product_qty CHECK (qty > 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS trial_signoff (
