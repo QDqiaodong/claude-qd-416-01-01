@@ -27,10 +27,16 @@ CREATE TABLE IF NOT EXISTS paper (
 
 CREATE TABLE IF NOT EXISTS product (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    order_id BIGINT,
+    order_id BIGINT NOT NULL,
+    -- 换单前的上一张归属工单（仅待入库换单时落痕）；已入库后随归属工单一起锁住
+    previous_order_id BIGINT,
     name VARCHAR(64),
-    qty INT,
-    status VARCHAR(16) NOT NULL
+    qty INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    CONSTRAINT chk_product_qty CHECK (qty > 0),
+    CONSTRAINT chk_product_status CHECK (status IN ('待入库', '已入库')),
+    KEY idx_product_order (order_id),
+    KEY idx_product_prev_order (previous_order_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS trial_signoff (
@@ -78,4 +84,48 @@ INSERT IGNORE INTO product (id, order_id, name, qty, status) VALUES
 
 INSERT IGNORE INTO trial_signoff (id, order_id, machine_id, paper_id, trial_qty, spine_thickness, stitch_count, paper_deducted, status) VALUES
  (1, 2, 1, 1, 5, 32, NULL, 1, '已过'),
- (2, 4, 4, 2, 3, NULL, 18, 1, '未过');
+ (2, 4, 4, 2, 3, NULL, 18, 1, '未过'),
+ (3, 3, 3, 3, 3, NULL, 16, 1, '已过'),
+ (4, 5, 2, 1, 4, 30, NULL, 1, '已过');
+
+-- ===== 老库升级（幂等，可重复执行）：成品入库链闭合 =====
+-- 1. 补换单留痕列与索引
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'product' AND COLUMN_NAME = 'previous_order_id') = 0,
+  'ALTER TABLE product ADD COLUMN previous_order_id BIGINT NULL AFTER order_id',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'product' AND INDEX_NAME = 'idx_product_order') = 0,
+  'ALTER TABLE product ADD KEY idx_product_order (order_id)',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'product' AND INDEX_NAME = 'idx_product_prev_order') = 0,
+  'ALTER TABLE product ADD KEY idx_product_prev_order (previous_order_id)',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- 2. 先清理历史脏数据（非法状态/零负数量/悬空工单），再上约束
+UPDATE product SET status = '待入库' WHERE status NOT IN ('待入库', '已入库');
+DELETE FROM product WHERE qty IS NULL OR qty <= 0;
+DELETE p FROM product p LEFT JOIN bind_order o ON o.id = p.order_id WHERE o.id IS NULL;
+
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+    WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'product' AND CONSTRAINT_NAME = 'chk_product_qty') = 0,
+  'ALTER TABLE product ADD CONSTRAINT chk_product_qty CHECK (qty > 0)',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+    WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'product' AND CONSTRAINT_NAME = 'chk_product_status') = 0,
+  'ALTER TABLE product ADD CONSTRAINT chk_product_status CHECK (status IN (''待入库'', ''已入库''))',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;

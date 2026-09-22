@@ -23,6 +23,14 @@
         >
           <div class="job">{{ o.jobName }}</div>
           <div class="meta">台号：{{ machineLabel(o.machineId) }} · 数量：{{ o.qty }}</div>
+          <div class="meta">
+            成品：已入库 {{ productStats[o.id]?.inStockQty || 0 }}
+            / 待入库 {{ productStats[o.id]?.pendingQty || 0 }}
+            <span
+              class="remain"
+              :class="{ over: (productStats[o.id]?.inStockQty || 0) > (o.qty || 0) }"
+            >· 可入库余量 {{ remainQty(o) }}</span>
+          </div>
           <el-tag
             v-if="signoffMap[o.id]"
             size="small"
@@ -72,6 +80,7 @@ const columns = ['待排', '进行中', '已完成']
 const orders = ref([])
 const machines = ref([])
 const signoffs = ref([])
+const products = ref([])
 const dialog = ref(false)
 const form = ref({ machineId: null, jobName: '', qty: 100, status: '待排' })
 
@@ -83,6 +92,23 @@ const grouped = computed(() => {
 
 const machineMap = computed(() => Object.fromEntries(machines.value.map((m) => [m.id, m.code])))
 const machineLabel = (id) => machineMap.value[id] || ('#' + id)
+
+// 每张工单的成品入库核对：已入库数量 / 待入库数量（已入库即最终结果，交班看这里对账）
+const productStats = computed(() => {
+  const m = {}
+  for (const p of products.value) {
+    const s = (m[p.orderId] ||= { inStockQty: 0, pendingQty: 0 })
+    if (p.status === '已入库') s.inStockQty += p.qty || 0
+    else if (p.status === '待入库') s.pendingQty += p.qty || 0
+  }
+  return m
+})
+// 可入库余量 = 工单数量 - 已入库数量；为负说明入库已超工单数量，红字提醒核对
+const remainQty = (o) => {
+  const used = productStats.value[o.id]?.inStockQty || 0
+  const r = (o.qty || 0) - used
+  return r < 0 ? `${r}（超入库，需核对）` : r
+}
 
 // 每张工单取最有效的一条签样（已过 > 未过 > 退回）展示在卡片上
 const signoffMap = computed(() => {
@@ -96,9 +122,16 @@ const signoffMap = computed(() => {
 const signoffTagType = (st) => (st === '已过' ? 'success' : st === '退回' ? 'danger' : 'info')
 
 const load = async () => {
-  orders.value = await http.get('/orders')
-  machines.value = await http.get('/machines')
-  signoffs.value = await http.get('/signoffs')
+  const [o, ma, s, p] = await Promise.all([
+    http.get('/orders'),
+    http.get('/machines'),
+    http.get('/signoffs'),
+    http.get('/products')
+  ])
+  orders.value = o
+  machines.value = ma
+  signoffs.value = s
+  products.value = p
 }
 
 const onDrag = (e, o) => e.dataTransfer.setData('text/plain', String(o.id))
@@ -139,5 +172,7 @@ onMounted(load)
 .card .job { font-weight: 600; }
 .card .meta { font-size: 12px; color: #8a7f7a; margin-top: 4px; }
 .card .so { margin-top: 6px; }
+.remain { color: #5f9a5f; }
+.remain.over { color: #d04437; font-weight: 600; }
 .empty { color: #c0b6b0; font-size: 13px; text-align: center; padding: 20px 0; }
 </style>

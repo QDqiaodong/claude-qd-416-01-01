@@ -18,6 +18,7 @@ public class SignoffService {
     @Autowired OrderRepository orderRepository;
     @Autowired MachineRepository machineRepository;
     @Autowired PaperRepository paperRepository;
+    @Autowired ProductRepository productRepository;
 
     public List<Signoff> list(Long orderId) {
         if (orderId != null) return signoffRepository.findByOrderId(orderId);
@@ -113,25 +114,50 @@ public class SignoffService {
 
     @Transactional
     public Signoff update(Long id, Map<String, Object> m) {
-        Signoff s = signoffRepository.findById(id).orElseThrow(() -> new BizException("签样不存在"));
-        if ("退回".equals(s.status)) throw new BizException("签样已退回，不能再修改");
+        // 只用标量查询取当前状态，不把实体装进一级缓存：
+        // 下面的 findByIdForUpdate 必须是本事务第一次加载该实体，才能真正按 FOR UPDATE
+        // 当前读拿到等锁期间其它事务提交的最终状态。
+        String currentStatus = signoffRepository.findStatusById(id);
+        if (currentStatus == null) throw new BizException("签样不存在");
+        if ("退回".equals(currentStatus)) throw new BizException("签样已退回，不能再修改");
 
         String target = str(m, "status");
         if (target != null && target.isBlank()) target = null;
         if (target != null && !"未过".equals(target) && !"已过".equals(target) && !"退回".equals(target))
             throw new BizException("签样状态必须是 未过/已过/退回");
 
-        if ("已过".equals(s.status)) {
+        if ("已过".equals(currentStatus)) {
             // 已过签样锁定机台和纸种：开印要对试装当时的那一台机、那一种纸
             if (m.containsKey("machineId") || m.containsKey("paperId"))
                 throw new BizException("已过签样不允许再改机台和纸种");
             if (m.containsKey("trialQty") || m.containsKey("spineThickness") || m.containsKey("stitchCount"))
                 throw new BizException("已过签样不允许再改试装参数");
-            if (target == null || "已过".equals(target)) return s;
+            if (target == null || "已过".equals(target))
+                return signoffRepository.findById(id).orElseThrow(() -> new BizException("签样不存在"));
             if (!"退回".equals(target)) throw new BizException("已过签样只能改为退回");
-            // 锁行当前读：与并发报修串行（报修只作废未过签样，已过签样由本动作退回）
-            s = signoffRepository.findByIdForUpdate(id);
+            Long lockedOrderId = signoffRepository.findOrderIdById(id);
+            // 入库链串行点：先锁归属工单行，再锁签样行。
+            // 建档 / 入库 / 换单也都从同一把工单行锁进入（换单同时锁原单与目标单，按 id 排序），
+            // 因此退回与这些动作不会交错各写各的，只会严格排队，谁先拿到工单行锁谁先落账。
+            Order gate = orderRepository.findByIdForUpdate(lockedOrderId);
+            if (gate == null) throw new BizException("归属工单不存在，不能退回签样");
+            // 锁行当前读：本事务第一次加载该实体，FOR UPDATE 才能读到等锁期间提交的最新状态
+            Signoff s = signoffRepository.findByIdForUpdate(id);
             if (s == null || "退回".equals(s.status)) throw new BizException("签样已退回，不能再修改");
+            // 入库链门禁：已过签样是挂在该工单上的成品的资格依据，
+            // 只要工单还挂着成品，签样就不能退回——已入库成品的归属工单已锁，
+            // 待入库成品必须先由登记人换到另一张仍有已过签样的已完成工单。
+            // FOR UPDATE 当前读：等工单行锁期间可能刚有换单/入库提交，按最新提交版本计数。
+            List<Product> products = productRepository.findByOrderIdForUpdate(s.orderId);
+            if (!products.isEmpty()) {
+                long pending = products.stream().filter(p -> "待入库".equals(p.status)).count();
+                long inStock = products.size() - pending;
+                String tip = "该工单上还挂着成品（待入库 " + pending + " 笔 / 已入库 " + inStock
+                        + " 笔），退回签样会让成品失去已过签样依据，不能退回；"
+                        + "请先把待入库成品换到另一张仍有已过签样的已完成工单"
+                        + (inStock > 0 ? "（已入库成品的归属工单已锁定，不能再动）" : "");
+                throw new BizException(tip);
+            }
             // 退回：已扣掉的试装纸不退回库存
             s.status = "退回";
             return signoffRepository.save(s);
@@ -139,8 +165,9 @@ public class SignoffService {
 
         // 未过签样：统一先锁涉及到的机台行（换机台时按 id 顺序锁两台），再锁签样行。
         // 报修同样先拿机台锁，因此两边在同一机台上严格串行，不存在各写一笔。
+        Long currentMachineId = signoffRepository.findMachineIdById(id);
         Set<Long> machineIds = new LinkedHashSet<>();
-        machineIds.add(s.machineId);
+        machineIds.add(currentMachineId);
         if (m.containsKey("machineId")) {
             Long targetMachineId = longV(m, "machineId");
             if (targetMachineId == null) throw new BizException("装订机不能为空");
@@ -148,8 +175,9 @@ public class SignoffService {
         }
         machineIds.stream().sorted().forEach(this::lockUsableMachine);
 
-        // 机台锁拿到后当前读复查：若报修已先提交，这条签样已是退回，不能再改
-        s = signoffRepository.findByIdForUpdate(id);
+        // 机台锁拿到后第一次加载实体即带 FOR UPDATE 当前读复查：
+        // 若报修已先提交，这条签样已是退回，不能再改
+        Signoff s = signoffRepository.findByIdForUpdate(id);
         if (s == null) throw new BizException("签样不存在");
         if ("退回".equals(s.status)) throw new BizException("签样已随机台报修作废成退回，不能再修改");
 

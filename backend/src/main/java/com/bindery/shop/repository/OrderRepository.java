@@ -15,5 +15,13 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     @Query("SELECT o FROM Order o WHERE o.machineId = :machineId AND o.status = '进行中'")
     List<Order> findRunningListByMachineIdForUpdate(@Param("machineId") Long machineId);
 
+    /**
+     * 成品建档 / 入库 / 换单入口用的当前读（SELECT ... FOR UPDATE）：
+     * 锁目标工单行后再锁该工单的已过签样行，使换单/入库与并发签样退回严格串行。
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT o FROM Order o WHERE o.id = :id")
+    Order findByIdForUpdate(@Param("id") Long id);
+
     List<Order> findByMachineId(Long machineId);
 }
